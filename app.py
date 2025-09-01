@@ -1,32 +1,47 @@
 # app.py
-import os
-import re
-from datetime import datetime, timezone
 
+# --- Streamlit MUST be configured first ---
+import streamlit as st
+st.set_page_config(page_title="GenAI Finance Bot", page_icon="💹", layout="wide")
+
+# Standard imports
+import os, re
+from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
-import streamlit as st
-from dotenv import load_dotenv
 from openai import OpenAI
 from pypdf import PdfReader
 import yfinance as yf
 
 # Embeddings (semantic RAG)
-import faiss
+try:
+    import faiss  # faiss-cpu (pinned in requirements)
+    FAISS_OK = True
+except Exception:
+    FAISS_OK = False
+
 from sentence_transformers import SentenceTransformer
 
 # =========================
-# Config & Global Styles
+# Secrets & API Key handling
 # =========================
-load_dotenv()
+def get_api_key() -> str | None:
+    # 1) Streamlit Cloud secrets
+    try:
+        key = st.secrets["OPENAI_API_KEY"]
+        if key:
+            return key
+    except Exception:
+        pass
+    # 2) Local .env (dev)
+    load_dotenv(find_dotenv(), override=False)
+    return os.getenv("OPENAI_API_KEY")
 
-st.set_page_config(
-    page_title="GenAI Finance Bot",
-    page_icon="💹",
-    layout="wide",
-)
+API_KEY = get_api_key()
 
-# ---- Custom CSS (glassy cards, nicer inputs, badges) ----
+# =========================
+# Global Styles
+# =========================
 st.markdown("""
 <style>
 :root {
@@ -43,9 +58,7 @@ st.markdown("""
   backdrop-filter: blur(4px);
 }
 .stTextInput > div > div > input,
-.stTextArea textarea {
-  border-radius: 12px !important;
-}
+.stTextArea textarea { border-radius: 12px !important; }
 .badge {
   display:inline-block; padding:4px 10px; border-radius:999px;
   background: #eef6ff; color:#0958d9; font-weight:600; font-size:12px;
@@ -58,16 +71,14 @@ st.markdown("""
 }
 .kpi .label { font-size:12px; opacity:0.7; }
 .kpi .value { font-size:18px; font-weight:700; }
-.hdr {
-  display:flex; align-items:center; gap:14px; margin-bottom:10px;
-}
+.hdr { display:flex; align-items:center; gap:14px; margin-bottom:10px; }
 .hdr .title { font-size:22px; font-weight:800; line-height:1.1; }
 .hdr .sub { opacity:0.7; font-size:13px; }
 hr { border: none; border-top: 1px dashed #e9e9e9; margin: 16px 0; }
 </style>
 """, unsafe_allow_html=True)
 
-# ---- Header ----
+# Header
 st.markdown("""
 <div class="hdr">
   <div style="font-size:40px; line-height:1;">💹</div>
@@ -80,6 +91,8 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
+if not API_KEY:
+    st.error("Missing OPENAI_API_KEY. Set it in **Streamlit Secrets** (Cloud) or a local **.env** (dev).")
 
 # =========================
 # Utilities
@@ -89,11 +102,10 @@ def clean_text(t: str) -> str:
     t = re.sub(r"\n{2,}", "\n", t)                       # collapse blank lines
     t = re.sub(r"(\w)-\n(\w)", r"\1\2", t)               # fix hyphen line-breaks
     t = re.sub(r"\n(?=[a-z])", " ", t)                   # join accidental line breaks mid-sentence
-    t = re.sub(r"\s+\|\s+\d+\s+\|\s*", " ", t)           # remove table-like pipes with page numbers
-    t = re.sub(r"\b(Page|PAGE)\s*\d+\b", " ", t)         # remove 'Page 12' etc.
+    t = re.sub(r"\s+\|\s+\d+\s+\|\s*", " ", t)           # remove table-like pipes
+    t = re.sub(r"\b(Page|PAGE)\s*\d+\b", " ", t)         # remove 'Page 12'
     t = re.sub(r"\s{2,}", " ", t)                        # collapse leftover double spaces
     return t.strip()
-
 
 def chunk_text(text: str, size: int = 1200, overlap: int = 200):
     chunks, i = [], 0
@@ -147,7 +159,6 @@ def factor_score(df: pd.DataFrame) -> pd.Series:
     momentum = zscore(winsorize(df["Momentum30d"]))
     return 0.30*val + 0.25*quality + 0.20*growth + 0.10*risk + 0.15*momentum
 
-# ---- Screener: logos + fundamentals (24h cache) ----
 @st.cache_data(ttl=24*60*60)
 def get_stock_snapshot(symbols: list[str]) -> pd.DataFrame:
     rows = []
@@ -169,7 +180,7 @@ def get_stock_snapshot(symbols: list[str]) -> pd.DataFrame:
 
             rows.append({
                 "Symbol": s,
-                "Logo": info.get("logo_url", ""),   # <-- logo url from Yahoo
+                "Logo": info.get("logo_url", ""),   # logo url from Yahoo
                 "PE": _safe(info.get("trailingPE")),
                 "PB": _safe(info.get("priceToBook")),
                 "EVEBITDA": _safe(ev_to_ebitda),
@@ -196,7 +207,6 @@ def get_stock_snapshot(symbols: list[str]) -> pd.DataFrame:
     df["Score"] = factor_score(df)
     return df
 
-# ---- Market wrap (24h cache) ----
 @st.cache_data(ttl=24*60*60)
 def get_market_wrap():
     indices = {"NIFTY 50": "^NSEI", "SENSEX": "^BSESN"}
@@ -222,7 +232,13 @@ def get_market_wrap():
     return pd.DataFrame(out), ts
 
 def style_screener_table(df: pd.DataFrame):
-    fmt_cols_pct = ["ROE","ProfitMargin","OperatingMargin","RevenueGrowth","EarningsGrowth","Momentum30d"]
+    # Gradient requires matplotlib; if unavailable, just format + bar
+    try:
+        import matplotlib  # noqa: F401
+        use_gradient = True
+    except Exception:
+        use_gradient = False
+
     df2 = df.copy()
     sty = (df2.style
         .format({
@@ -232,8 +248,12 @@ def style_screener_table(df: pd.DataFrame):
             "DebtToEquity": "{:.2f}", "Momentum30d": "{:.1f}%", "Score": "{:.2f}"
         })
         .bar(subset=["Score"], color="#e8f3ff")
-        .background_gradient(subset=fmt_cols_pct+["Score"], cmap="Greens")
     )
+    if use_gradient:
+        sty = sty.background_gradient(
+            subset=["ROE","ProfitMargin","OperatingMargin","RevenueGrowth","EarningsGrowth","Momentum30d","Score"],
+            cmap="Greens"
+        )
     return sty
 
 def kpi(label: str, value: str):
@@ -244,25 +264,16 @@ def kpi(label: str, value: str):
     </div>
     """, unsafe_allow_html=True)
 
-
 # =========================
 # External Services
 # =========================
-# OpenRouter (OpenAI-compatible)
-client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=os.getenv("OPENAI_API_KEY"),
-)
-
-# Embedding model (fast & lightweight)
+client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=API_KEY)
 embed_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-
 
 # =========================
 # Tabs
 # =========================
 tab1, tab2, tab3 = st.tabs(["🧠 PDF Q&A", "📊 Screener", "📰 Market Wrap"])
-
 
 # =========================
 # Tab 1: PDF Q&A
@@ -280,12 +291,16 @@ with tab1:
                 pages = [page.extract_text() or "" for page in reader.pages]
                 text = clean_text("\n".join(pages))
                 st.success(f"Text extracted • {len(reader.pages)} pages • {len(text):,} chars")
+
                 chunks = chunk_text(text)
-                index, _ = build_faiss(chunks, embed_model)
-                st.session_state.pdf_chunks = chunks
-                st.session_state.pdf_index = index
-                st.session_state.embed_model = embed_model
-                kpi("Chunks", f"{len(chunks):,}")
+                if not FAISS_OK:
+                    st.warning("FAISS not available; semantic search is disabled on this platform.")
+                else:
+                    index, _ = build_faiss(chunks, embed_model)
+                    st.session_state.pdf_chunks = chunks
+                    st.session_state.pdf_index = index
+                    st.session_state.embed_model = embed_model
+                    kpi("Chunks", f"{len(chunks):,}")
             except Exception as e:
                 st.error(f"PDF read error: {e}")
 
@@ -294,10 +309,10 @@ with tab1:
         user_q = st.text_input("Type a focused question", "What are the top risks mentioned?")
         ask = st.button("Generate Answer", type="primary", use_container_width=True)
         if ask:
-            if "pdf_index" not in st.session_state:
-                st.error("Please upload and index a PDF first.")
-            elif not os.getenv("OPENAI_API_KEY"):
-                st.error("OPENAI_API_KEY missing in .env / Streamlit secrets.")
+            if not API_KEY:
+                st.error("Missing OPENAI_API_KEY (Secrets or .env).")
+            elif not FAISS_OK or "pdf_index" not in st.session_state:
+                st.error("Please upload & index a PDF first (and ensure FAISS is available).")
             else:
                 try:
                     hits = top_k_chunks(
@@ -331,7 +346,6 @@ Context:
 
     st.markdown('</div>', unsafe_allow_html=True)
 
-
 # =========================
 # Tab 2: Screener (with logos)
 # =========================
@@ -364,20 +378,41 @@ with tab2:
             k4.metric("Avg Momentum 30d", f"{picks['Momentum30d'].mean():.1f}%")
 
             st.markdown("#### 🏆 Top 5 Picks (with logos)")
-            # Compact card rows with logo + quick KPIs
-            for _, row in picks.iterrows():
-                logo_html = f"<img src='{row['Logo']}' width='40' style='border-radius:8px;border:1px solid #eee;'/>" if row['Logo'] else "📈"
-                st.markdown(f"""
-                <div style="display:flex;align-items:center;gap:12px;margin:8px 0;padding:8px 10px;border:1px solid #eee;border-radius:12px;background:#fff;">
-                  {logo_html}
-                  <div style="display:flex;flex-direction:column;">
-                    <div style="font-weight:700;">{row['Symbol']}</div>
-                    <div style="opacity:0.75;font-size:13px;">
-                      Score: {row['Score']:.2f} • PE: {row['PE']:.2f} • Momentum30d: {row['Momentum30d']:.1f}%
+
+            # 2-column grid of rich cards
+            cols = st.columns(2)
+            smin, smax = float(picks["Score"].min()), float(picks["Score"].max())
+
+            for i, row in picks.iterrows():
+                with cols[i % 2]:
+                    # Logo (fallback placeholder if missing)
+                    logo_html = (
+                        f"<img src='{row['Logo']}' width='40' style='border-radius:8px;border:1px solid rgba(255,255,255,0.12);'/>"
+                        if row['Logo'] else
+                        "<div style='width:40px;height:40px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);display:flex;align-items:center;justify-content:center;opacity:.8;'>📈</div>"
+                    )
+
+                    score = float(row["Score"])
+                    pct = 100 if smax == smin else int(100 * (score - smin) / (smax - smin))
+
+                    mom = float(row["Momentum30d"])
+                    mom_cls = "good" if mom >= 0 else "bad"
+                    pe_txt = f"{row['PE']:.2f}" if np.isfinite(row["PE"]) else "—"
+                    last_txt = f"₹{row['LastPrice']:.2f}" if row.get("LastPrice") else "—"
+                    name = row.get("ShortName") or row["Symbol"]
+
+                    st.markdown(f"""
+                    <div class="pick-card" style="margin:8px 0;">
+                      {logo_html}
+                      <div class="meta" style="flex:1;">
+                        <div class="pick-title">{name} <span style="opacity:.6;">({row['Symbol']})</span></div>
+                        <div class="pick-sub">Price: <b>{last_txt}</b> • PE: <b>{pe_txt}</b> • Momentum 30d: <b class="{mom_cls}">{mom:+.1f}%</b></div>
+                        <div class="pick-sub">Score</div>
+                        <div class="scorebar"><div style="width:{pct}%"></div></div>
+                      </div>
+                      <div class="kpill">Score&nbsp;{score:.2f}</div>
                     </div>
-                  </div>
-                </div>
-                """, unsafe_allow_html=True)
+                    """, unsafe_allow_html=True)
 
             # Detailed table below
             st.markdown("#### Details")
@@ -390,7 +425,7 @@ with tab2:
             )
 
             # LLM rationale (optional)
-            if os.getenv("OPENAI_API_KEY"):
+            if API_KEY:
                 rationale_prompt = f"""
 Summarize in 4-7 bullets why these Indian stocks might rank as top picks today,
 given value (PE/PB/EV/EBITDA), quality (ROE/margins), growth (revenue & earnings),
@@ -428,7 +463,14 @@ with tab3:
         c1, c2, c3 = st.columns(3)
         last_nifty = wrap_df.loc[wrap_df["Index"] == "NIFTY 50", "Last"].values[0] if "NIFTY 50" in wrap_df["Index"].values else None
         last_sensex = wrap_df.loc[wrap_df["Index"] == "SENSEX", "Last"].values[0] if "SENSEX" in wrap_df["Index"].values else None
-        kpi("Last Updated", ts)
+        # KPIs
+        def render_kpi(label, value, delta=None):
+            if delta is None:
+                kpi(label, value)
+            else:
+                st.metric(label, value, delta)
+
+        render_kpi("Last Updated", ts)
         if last_nifty is not None:
             c1.metric("NIFTY 50 (Last)", f"{last_nifty:,.0f}",
                       f"{wrap_df.loc[wrap_df['Index']=='NIFTY 50','DayChangePct'].values[0]:+.2f}%")
@@ -445,7 +487,7 @@ with tab3:
         st.dataframe(fmt, use_container_width=True)
 
         # Short LLM wrap
-        if os.getenv("OPENAI_API_KEY"):
+        if API_KEY:
             try:
                 wrap_prompt = f"""
 Write a short market wrap (4-6 bullet points) for Indian markets based on this index snapshot.
