@@ -1,0 +1,40 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+env/
+venv/
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Streamlit secrets
+.env
+.streamlit/secrets.toml
+
+# Logs / reports
+*.log
+*.out
+*.err
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
