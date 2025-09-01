@@ -22,6 +22,13 @@ except Exception:
 
 from sentence_transformers import SentenceTransformer
 
+# Optional dotenv (for local dev). Streamlit Cloud uses st.secrets.
+try:
+    from dotenv import load_dotenv, find_dotenv
+except Exception:
+    def load_dotenv(*args, **kwargs): return False
+    def find_dotenv(*args, **kwargs): return ""
+
 # =========================
 # Secrets & API Key handling
 # =========================
@@ -38,7 +45,6 @@ def get_api_key() -> str | None:
     return os.getenv("OPENAI_API_KEY")
 
 API_KEY = get_api_key()
-
 # =========================
 # Global Styles
 # =========================
